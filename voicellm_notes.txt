@@ -1,0 +1,595 @@
+# openai wrapper for voice control tts & stt requirements.txt from amica
+https://github.com/semperai/basic-openai-api-wrapper/blob/master/requirements.txt
+
+# architecture
+Wake word detection > Speech transcription > Language model query > Synthesise speech 
+
+
+####### Wake word detection ######## (We need classifier to get statistics score probability to know if the word spoken is our wake up mic word)
+# get a 'audio detection' model with 'speech commands' and see which label it has (check: MIT/ast-finetuned-speech-commands-v2 and SHENMU007/speechcommand-demo)
+from transformers import pipeline
+import torch
+
+device = "cuda:0" if torch.cuda.is_available() else "cpu"
+
+classifier = pipeline(
+    "audio-classification", model="MIT/ast-finetuned-speech-commands-v2", device=device
+)
+
+# see which labels are available
+classifier.model.config.id2label
+# eg:label 27
+classifier.model.config.id2label[27]  outputs 'marvin'
+
+# funtion to detect word 'marvin' with prob_threshold probability that it is the right word
+from transformers.pipelines.audio_utils import ffmpeg_microphone_live
+
+# launch_fb return true if the word is not just noise but our wake up mic word (maybe pass in as argument our wake up word)
+def launch_fn(
+    wake_word="marvin",
+    prob_threshold=0.5,
+    chunk_length_s=2.0,
+    stream_chunk_s=0.25,
+    debug=False,
+):
+    if wake_word not in classifier.model.config.label2id.keys():
+        raise ValueError(
+            f"Wake word {wake_word} not in set of valid class labels, pick a wake word in the set {classifier.model.config.label2id.keys()}."
+        )
+
+    sampling_rate = classifier.feature_extractor.sampling_rate
+
+    mic = ffmpeg_microphone_live(
+        sampling_rate=sampling_rate,
+        chunk_length_s=chunk_length_s,
+        stream_chunk_s=stream_chunk_s,
+    )
+
+    print("Listening for wake word...")
+    
+    # pass in mic chunks in classifier
+    for prediction in classifier(mic):
+        prediction = prediction[0]
+        if debug:
+            print(prediction)
+        # if the word is our wake up word
+        if prediction["label"] == wake_word:
+            # and if the probability that it is our wake up word is higher than our threshold
+            if prediction["score"] > prob_threshold:
+                return True
+
+####### Speech transcription ######## (here add a voice detection model as the chunk length of 5 seconds is arbitrary and could be too long or too short, better record just while speaking no matter how long)
+
+# load a transcriber model in the pipeline
+transcriber = pipeline(
+    "automatic-speech-recognition", model="openai/whisper-base.en", device=device
+)
+
+# create a function to transcribe with 5 seconds chunk record length (meaning you have 5 seconds of speech so adjust as needed)
+import sys
+
+# transcribe function returns a text item
+def transcribe(chunk_length_s=5.0, stream_chunk_s=1.0):
+    sampling_rate = transcriber.feature_extractor.sampling_rate
+
+    mic = ffmpeg_microphone_live(
+        sampling_rate=sampling_rate,
+        chunk_length_s=chunk_length_s,
+        stream_chunk_s=stream_chunk_s,
+    )
+
+    print("Start speaking...")
+    for item in transcriber(mic, generate_kwargs={"max_new_tokens": 128}):
+        sys.stdout.write("\033[K")
+        print(item["text"], end="\r") #\r return to first character of the line
+        if not item["partial"][0]:
+            break
+
+    return item["text"]
+
+####### Language model query ######## (Can be the place to replace it by LMStudio)
+# we will use huggingface cli api models and find an 'instruct' fine tuned model (huggingface token needed, so login cli and export token in env var (we can create a script that does login and export the token from .env file storing our token)) we get a response from requets call in json
+
+from huggingface_hub import HfFolder
+import requests
+
+# query function takes a query and returns a json response
+def query(text, model_id="tiiuae/falcon-7b-instruct"):
+    api_url = f"https://api-inference.huggingface.co/models/{model_id}"
+    headers = {"Authorization": f"Bearer {HfFolder().get_token()}"}
+    payload = {"inputs": text}
+
+    print(f"Querying...: {text}")
+    response = requests.post(api_url, headers=headers, json=payload)
+    return response.json()[0]["generated_text"][len(text) + 1 :]
+
+####### Synthesise speech ########
+# now let's get that answer rendered in speech
+from transformers import SpeechT5Processor, SpeechT5ForTextToSpeech, SpeechT5HifiGan
+
+processor = SpeechT5Processor.from_pretrained("microsoft/speecht5_tts")
+
+model = SpeechT5ForTextToSpeech.from_pretrained("microsoft/speecht5_tts").to(device)
+vocoder = SpeechT5HifiGan.from_pretrained("microsoft/speecht5_hifigan").to(device)
+
+# speaker embeddings
+from datasets import load_dataset
+
+embeddings_dataset = load_dataset("Matthijs/cmu-arctic-xvectors", split="validation")
+speaker_embeddings = torch.tensor(embeddings_dataset[7306]["xvector"]).unsqueeze(0)
+
+# generate function return the voice by generating speech for the llm answer
+def synthesise(text):
+    inputs = processor(text=text, return_tensors="pt")
+    speech = model.generate_speech(
+        inputs["input_ids"].to(device), speaker_embeddings.to(device), vocoder=vocoder
+    )
+    return speech.cpu()
+
+# this to test if the voice is generated (if we can hear the sentence)
+from IPython.display import Audio
+
+audio = synthesise(
+    "Shibuya is a place we can relax in manga kissa's."
+)
+
+Audio(audio, rate=16000) # this uses the python imported 'Audio' that is going the output sound
+
+#### Chain our pipeline
+
+# start the mic
+launch_fn()
+# transcribe voice
+transcription = transcribe()
+# get a json response
+response = query(transcription)
+# prepare the audio to be voiced
+audio = synthesise(response)
+# hear the answer
+Audio(audio, rate=16000, autoplay=True)
+
+
+###### CREATE UTILITY TO IT BY GENERATING AGENTS FROM THE RETURNED VOICE ######
+
+# we use huggingface model for to create here an image generator agent
+nano agent_image_generator:
+from transformers import HfAgent
+
+agent = HfAgent(
+    url_endpoint="https://api-inference.huggingface.co/models/bigcode/starcoder"
+)
+
+agent.run("Generate an image of Shibuya") # we can probably create a function that takes as argument the prompt the text returned by our transcription for example
+
+# our new pipelien workflow becomes
+# start the mic recording
+launch_fn()
+# get  the voice transcribe to text
+transcription = transcribe()
+# get our transcription as prompt sent to make an image
+agent.run(transcription)
+
+# note:
+prompt = "Generate an image of a cat, caption it, and speak the caption"
+We can get our function to be smarter and create the image on certain key words, at the same time have text answer and voice it
+
+
+##################### 2nd script tts stt
+# use script to install also pyaudio and espeak
+sudo apt install espeak espeak-ng
+sudo apt-get install -y portaudio19-dev python-pyaudio python3-pyaudio
+sudo apt-get install portaudio19-dev
+pip install pyaudio
+
+# when launching app: model will be downloaded at:
+/home/creditizens/.local/share/tts/tts_models--en--ljspeech--vits█
+
+# exampel of curl command to test (but go error because model is handled in the script)
+curl -H 'Content-Type: application/json' -d '{ "content" : {"title":"Fight","body":"The fight will be  Tyson vs Ali", "id": 123, "content": "Junko will be at Shibuya again tomorrow at 7pm."}, model="tts_models/en/ljspeech/vits", "name": "Junko}' -X POST http://127.0.0.1:5000/<ROUTE_URL_TO_TEST>
+
+# huggingface installs
+pip install --upgrade huggingface_hub
+pip install 'huggingface_hub[tensorflow]' && pip install 'huggingface_hub[cli,torch]'
+
+#For CPU-support only, you can conveniently install 🤗 Transformers and a deep learning library in one line. For example, install 🤗 Transformers and PyTorch with:
+pip install 'transformers[torch]'
+
+# 🤗 Transformers and TensorFlow 2.0:
+pip install 'transformers[tf-cpu]'
+
+# login with your token
+huggingface-cli login
+
+### free opensource embedding model interesting: https://huggingface.co/speechbrain/spkrec-ecapa-voxceleb
+pip install speechbrain # install
+import torchaudio
+from speechbrain.pretrained import EncoderClassifier
+classifier = EncoderClassifier.from_hparams(source="speechbrain/spkrec-ecapa-voxceleb")
+signal, fs =torchaudio.load('tests/samples/ASR/spk1_snt1.wav')
+embeddings = classifier.encode_batch(signal)
+
+### free opensource embedding model interesting: https://huggingface.co/hkunlp/instructor-large
+# no fine tune needed already good for lassification, retrieval, clustering, text evaluation and different sector finance, science...
+pip install InstructorEmbedding # install
+from InstructorEmbedding import INSTRUCTOR
+model = INSTRUCTOR('hkunlp/instructor-large')
+sentence = "3D ActionSLAM: wearable person tracking in multi-floor environments"
+instruction = "Represent the Science title:"
+embeddings = model.encode([[instruction,sentence]])
+print(embeddings)
+
+# calculate embeddings
+from sklearn.metrics.pairwise import cosine_similarity
+sentences_a = [['Represent the Science sentence: ','Parton energy loss in QCD matter'], 
+               ['Represent the Financial statement: ','The Federal Reserve on Wednesday raised its benchmark interest rate.']]
+sentences_b = [['Represent the Science sentence: ','The Chiral Phase Transition in Dissipative Dynamics'],
+               ['Represent the Financial statement: ','The funds rose less than 0.5 per cent on Friday']]
+embeddings_a = model.encode(sentences_a)
+embeddings_b = model.encode(sentences_b)
+similarities = cosine_similarity(embeddings_a,embeddings_b)
+print(similarities)
+
+# retrieval embeddings: for information retrieval
+import numpy as np
+from sklearn.metrics.pairwise import cosine_similarity
+query  = [['Represent the Wikipedia question for retrieving supporting documents: ','where is the food stored in a yam plant']]
+corpus = [['Represent the Wikipedia document for retrieval: ','Capitalism has been dominant in the Western world since the end of feudalism, but most feel[who?] that the term "mixed economies" more precisely describes most contemporary economies, due to their containing both private-owned and state-owned enterprises. In capitalism, prices determine the demand-supply scale. For example, higher demand for certain goods and services lead to higher prices and lower demand for certain goods lead to lower prices.'],
+          ['Represent the Wikipedia document for retrieval: ',"The disparate impact theory is especially controversial under the Fair Housing Act because the Act regulates many activities relating to housing, insurance, and mortgage loansâ€”and some scholars have argued that the theory's use under the Fair Housing Act, combined with extensions of the Community Reinvestment Act, contributed to rise of sub-prime lending and the crash of the U.S. housing market and ensuing global economic recession"],
+          ['Represent the Wikipedia document for retrieval: ','Disparate impact in United States labor law refers to practices in employment, housing, and other areas that adversely affect one group of people of a protected characteristic more than another, even though rules applied by employers or landlords are formally neutral. Although the protected classes vary by statute, most federal civil rights laws protect based on race, color, religion, national origin, and sex as protected traits, and some laws include disability status and other traits as well.']]
+query_embeddings = model.encode(query)
+corpus_embeddings = model.encode(corpus)
+similarities = cosine_similarity(query_embeddings,corpus_embeddings)
+retrieved_doc_id = np.argmax(similarities)
+print(retrieved_doc_id)
+
+# clusterring embeddings: clustering text in groups
+import sklearn.cluster
+sentences = [['Represent the Medicine sentence for clustering: ','Dynamical Scalar Degree of Freedom in Horava-Lifshitz Gravity'],
+             ['Represent the Medicine sentence for clustering: ','Comparison of Atmospheric Neutrino Flux Calculations at Low Energies'],
+             ['Represent the Medicine sentence for clustering: ','Fermion Bags in the Massive Gross-Neveu Model'],
+             ['Represent the Medicine sentence for clustering: ',"QCD corrections to Associated t-tbar-H production at the Tevatron"],
+             ['Represent the Medicine sentence for clustering: ','A New Analysis of the R Measurements: Resonance Parameters of the Higher,  Vector States of Charmonium']]
+embeddings = model.encode(sentences)
+clustering_model = sklearn.cluster.MiniBatchKMeans(n_clusters=2)
+clustering_model.fit(embeddings)
+cluster_assignment = clustering_model.labels_
+print(cluster_assignment)
+
+### Ollama LangChain embeddings
+from langchain_community.embeddings import OllamaEmbeddings
+embeddings = OllamaEmbeddings()
+text = "This is a test document."
+query_result = embeddings.embed_query(text)
+query_result[:5]
+Outputs: 
+[-0.09996652603149414,
+ 0.015568195842206478,
+ 0.17670190334320068,
+ 0.16521021723747253,
+ 0.21193109452724457]
+doc_result = embeddings.embed_documents([text])
+doc_result[0][:5]
+Outputs:
+[-0.04242777079343796,
+ 0.016536075621843338,
+ 0.10052520781755447,
+ 0.18272875249385834,
+ 0.2079043835401535]
+embeddings = OllamaEmbeddings(model="llama2:7b") 
+text = "This is a test document."
+query_result = embeddings.embed_query(text)
+query_result[:5]
+Outputs:
+[-0.09996627271175385,
+ 0.015567859634757042,
+ 0.17670205235481262,
+ 0.16521376371383667,
+ 0.21193283796310425]
+doc_result = embeddings.embed_documents([text])
+doc_result[0][:5]
+Outputs:
+[-0.042427532374858856,
+ 0.01653730869293213,
+ 0.10052604228258133,
+ 0.18272635340690613,
+ 0.20790338516235352]
+
+embeddings = OllamaEmbeddings(model: "llama2", baseUrl: "http://localhost:11434", temperature: 0.7)
+
+# ollama curl command to see what is sent
+curl http://my_virtual_machine_ip:11434/api/chat -d '{
+"model": "openhermes2.5-mistral",
+"messages": [{ "role": "user", "content": "Hello" }],
+"stream": false
+}'
+
+# Ollama mimmicking Openai for local use (ollama serve, then ollama run <MODEL_NAME>)
+from openai import OpenAI
+
+client = OpenAI(
+    base_url='http://localhost:11434/v1/',
+
+    # required but ignored
+    api_key='ollama',
+)
+
+chat_completion = client.chat.completions.create(
+    messages=[
+        {
+            'role': 'user',
+            'content': 'Say this is a test',
+        }
+    ],
+    model='llama2',
+)
+
+# for kubernetes, yaml file to deploy ollama
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ollama
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ollama
+  namespace: ollama
+spec:
+  selector:
+    matchLabels:
+      name: ollama
+  template:
+    metadata:
+      labels:
+        name: ollama
+    spec:
+      containers:
+      - name: ollama
+        image: ollama/ollama:latest
+        ports:
+        - name: http
+          containerPort: 11434
+          protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ollama
+  namespace: ollama
+spec:
+  type: ClusterIP
+  selector:
+    name: ollama
+  ports:
+  - port: 80
+    name: http
+    targetPort: http
+    protocol: TCP
+
+then create a port forwarding: kubectl -n ollama port-forward service/ollama 11434:80
+then access to ollama commands: ollama run orca-mini:3b
+
+### postgresql installation before installing extension for embeddings
+# install postgresql 
+sudo apt install python3-pip python3-dev libpq-dev postgresql postgresql-contrib -y
+# install pg vector extension
+# and enable pgvector , create extension :sudo apt install postgresql-<VERSION_OF_POSTGRESQL>-pgvector #14.10 # didn't work " sudo apt install postgresql-14-pgvector, so we will install from github using:
+git clone https://github.com/ankane/pgvector.git  or git clone https://github.com/pgvector/pgvector (here the doc is better)
+sudo apt install postgresql-server-dev-14 -y
+cd pgvector
+make
+sudo make install
+
+# install embedding extension but normally no need because of pg_vector already has it
+sudo apt install postgresql-server-dev-<YOUR_INSTALLED_POSTGRESQL_VERSION>
+git clone https://github.com/neondatabase/pg_embedding.git
+cd pg_embedding
+make
+sudo make install
+
+# create those extenstion to existing databases of your choice + creation user and privileges
+sudo -u postgres psql # run as postgres user
+CREATE EXTENSION pgvector; # didn't work
+CREATE EXTENSION vector; # did work
+CREATE EXTENSION embedding;
+sudo systemctl enable postgresql
+sudo service postgresql start
+sudo -u postgres psql
+CREATE DATABASE voiceembed; # should normally be personal site but typo error
+CREATE USER creditizens WITH PASSWORD 'creditizens';
+ALTER ROLE creditizens SET client_encoding TO 'utf8';
+ALTER ROLE creditizens SET default_transaction_isolation TO 'read committed';
+ALTER ROLE creditizens SET timezone TO 'UTC';
+ALTER USER creditizens WITH SUPERUSER;
+GRANT ALL PRIVILEGES ON DATABASE voiceembed TO creditizens;
+\q
+
+# use to conenct as creditizens to database: sudo -u creditizens psql -d "voiceembed"
+# and create extension for this database after connecting
+CREATE EXTENSION vector;
+CREATE EXTENSION embedding;
+Output:
+ERROR:  access method "hnsw" already exists
+
+# Query database using terminal command
+psql -U creditizens -W creditizens -d voiceembed -c "SELECT *  FROM voiceembed WHERE uuid = 234"
+# add column to table
+ALTER TABLE voiceembed ADD COLUMN embedding VECTOR(1538)
+
+"""
+CREATE TABLE your_table_name (
+    id SERIAL PRIMARY KEY,
+    vector vector(1024), # dimension value for mistral:7b type of model 
+    content TEXT,
+    metadata JSONB
+);
+
+"""
+
+### Some scenarios of relational database and vector extension for same database
+## Example of embedding relation with raltional database
+To integrate embeddings with a relational database in PostgreSQL using pgvector, consider a scenario where you have a table for user profiles and another table storing user preferences as embeddings:
+
+User Profiles Table: This table contains user information with a primary key.
+
+Columns: user_id (Primary Key), name, email
+User Preferences Embeddings Table: Stores vector embeddings of user preferences.
+
+Columns: embedding_id (Primary Key), user_id (Foreign Key to User Profiles), embedding (vector)
+The user_id in the Embeddings table references user_id in the User Profiles table, establishing a relational link. You can query user information and their preferences together using SQL JOIN operations.
+
+Python pseudo-code for such a scenario:
+
+# Assuming SQLAlchemy for ORM
+from sqlalchemy import create_engine, Column, Integer, String, ForeignKey
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import relationship, sessionmaker
+from sqlalchemy.dialects.postgresql import ARRAY
+
+Base = declarative_base()
+
+class UserProfile(Base):
+    __tablename__ = 'user_profiles'
+    user_id = Column(Integer, primary_key=True)
+    name = Column(String)
+    email = Column(String)
+    # Link to embeddings
+    preferences = relationship("UserPreference", back_populates="profile")
+
+class UserPreference(Base):
+    __tablename__ = 'user_preferences'
+    embedding_id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey('user_profiles.user_id'))
+    embedding = Column(ARRAY(Float))  # Using ARRAY to simulate vector
+    # Back-reference to profile
+    profile = relationship("UserProfile", back_populates="preferences")
+
+# Setup DB and create tables
+engine = create_engine('postgresql://user:password@localhost/mydatabase')
+Base.metadata.create_all(engine)
+This code outlines defining models and their relationships, not the specific use of pgvector. Adjust the embedding column data type according to how you implement pgvector in your database.
+
+### langchain pgvector embeddings
+import openai
+import psycopg2
+from psycopg2.extras import execute_values
+
+# Configure OpenAI key
+openai.api_key = 'your_openai_api_key_here'
+
+# Database connection parameters
+conn_params = {
+    "database": "api",
+    "user": "myuser",
+    "password": "ChangeMe",
+    "host": "127.0.0.1",
+    "port": 5433
+}
+
+# Create a database connection
+conn = psycopg2.connect(**conn_params)
+cursor = conn.cursor()
+
+# Assuming a table creation like this (you should have this done beforehand):
+# CREATE TABLE testlangchain (
+#     id SERIAL PRIMARY KEY,
+#     vector vector(512),
+#     content TEXT,
+#     metadata JSONB
+# );
+
+def add_documents(documents):
+    embeddings = [openai.Embedding.create(input=doc['pageContent'])['data'][0]['embedding'] for doc in documents]
+    values = [(doc['pageContent'], embedding, doc['metadata']) for doc, embedding in zip(documents, embeddings)]
+    execute_values(cursor, """
+    INSERT INTO testlangchain (content, vector, metadata) VALUES %s;
+    """, values)
+    conn.commit()
+
+def similarity_search(query, limit):
+    embedding = openai.Embedding.create(input=query)['data'][0]['embedding']
+    cursor.execute("""
+    SELECT content, metadata FROM testlangchain
+    ORDER BY vector <-> %s LIMIT %s;
+    """, (embedding, limit))
+    return cursor.fetchall()
+
+def delete_documents(filter):
+    cursor.execute("""
+    DELETE FROM testlangchain WHERE metadata @> %s;
+    """, (json.dumps(filter),))
+    conn.commit()
+
+# Example usage
+add_documents([
+    {"pageContent": "what's this", "metadata": {"a": 2}},
+    {"pageContent": "Cat drinks milk", "metadata": {"a": 1}}
+])
+
+results = similarity_search("water", 1)
+print(results)
+
+delete_documents({"a": 1})
+
+results2 = similarity_search("water", 1)
+print(results2)
+
+# Close connection
+conn.close()
+
+
+## Install langchain and all needed to connect with pgvector
+pip install langchain
+pip install pgvector
+pip install langchain-openai
+pip install psycopg2-binary
+pip install tiktoken
+pip install pgvector
+
+install ollama as well for embeddings
+Go to your virtual environment were packages are installed and change the model name, it has to match the model that you are running on ollama:
+sudo nano /home/creditizens/voice_llm/voice_venv/lib/python3.10/site-packages/langchain_community/embeddings/ollama.py
+line 37(at the moment...) :     model: str = "mistral:7b" # we are running mistral:7b
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
