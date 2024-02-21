@@ -1,0 +1,34 @@
+# environement variable and virutal environment
+env
+.env
+venv
+*venv
+env*
+# external directories and files
+=0.16.4
+=0.19.4
+__pycache__/
+app.py
+full_speech_conversation.txt
+lantern/
+pg_embedding/
+pyaudio/
+voice_app.py
+=*
+__pycache__/*
+app*
+full_speech_conversation*
+lantern/*
+pg_embedding/*
+pyaudio/*
+voice_app*
+*=0.16.4
+*=0.19.4
+*__pycache__/
+*app.py
+*full_speech_conversation.txt
+*lantern/
+*pg_embedding/
+*pyaudio/
+*oice_app.py
+

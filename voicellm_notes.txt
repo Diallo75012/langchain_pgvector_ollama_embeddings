@@ -184,7 +184,7 @@ pip install pyaudio
 # when launching app: model will be downloaded at:
 /home/creditizens/.local/share/tts/tts_models--en--ljspeech--vits█
 
-# exampel of curl command to test (but go error because model is handled in the script)
+# example of curl command to test (but go error because model is handled in the script)
 curl -H 'Content-Type: application/json' -d '{ "content" : {"title":"Fight","body":"The fight will be  Tyson vs Ali", "id": 123, "content": "Junko will be at Shibuya again tomorrow at 7pm."}, model="tts_models/en/ljspeech/vits", "name": "Junko}' -X POST http://127.0.0.1:5000/<ROUTE_URL_TO_TEST>
 
 # huggingface installs
@@ -370,6 +370,7 @@ spec:
 then create a port forwarding: kubectl -n ollama port-forward service/ollama 11434:80
 then access to ollama commands: ollama run orca-mini:3b
 
+
 ### postgresql installation before installing extension for embeddings
 # install postgresql 
 sudo apt install python3-pip python3-dev libpq-dev postgresql postgresql-contrib -y
@@ -387,6 +388,26 @@ git clone https://github.com/neondatabase/pg_embedding.git
 cd pg_embedding
 make
 sudo make install
+
+# install lanter postgresql extension for retriever similarity having cosine similarity search
+git clone --recursive https://github.com/lanterndata/lantern.git
+cd lantern
+mkdir build
+cd build
+sudo apt install cmake
+cmake ..
+make install
+and connect to database like others and run: create extension lantern;
+
+# Note for lantern: dimensions can be changed (default is 1536)
+cat /home/creditizens/voice_llm/voice_venv/lib/python3.10/site-packages/langchain_community/vectorstores/lantern.py | grep ADA_TOKEN_COUNT
+ADA_TOKEN_COUNT = 1536 # here you can change the dimension
+        dims: int = ADA_TOKEN_COUNT,
+           dims: Dimensions of the vectors in collection. default: 1536
+            "dim = :dim, "
+                    "dim": dims,
+# note again Lanter if having issues with embedding dimension size that is default to 1536, it can't exceed 2000 so you need to change ollama options.
+# for Lantern embeddings need to do some manipulation and set "options": {"m_embd": 1536}, doesn't work here, need to change it in the ollama native package manually at line 188 and 469 approx. /home/creditizens/voice_llm/voice_venv/lib/python3.10/site-packages/ollama/_client.py
 
 # create those extenstion to existing databases of your choice + creation user and privileges
 sudo -u postgres psql # run as postgres user
@@ -469,6 +490,11 @@ class UserPreference(Base):
 engine = create_engine('postgresql://user:password@localhost/mydatabase')
 Base.metadata.create_all(engine)
 This code outlines defining models and their relationships, not the specific use of pgvector. Adjust the embedding column data type according to how you implement pgvector in your database.
+
+# SQLAlchemy create dimensions in field : eg: 1024
+mytable = Table("mytable", metadata,
+            Column("data", ARRAY(Integer, dimensions=1024))
+          )
 
 ### langchain pgvector embeddings
 import openai
@@ -553,6 +579,11 @@ sudo nano /home/creditizens/voice_llm/voice_venv/lib/python3.10/site-packages/la
 line 37(at the moment...) :     model: str = "mistral:7b" # we are running mistral:7b
 
 
+# # Initialize the vectorstore as empty
+# import faiss
+# embedding_size = 1536
+# index = faiss.IndexFlatL2(embedding_size)
+# vectorstore = FAISS(embeddings_model.embed_query, index, InMemoryDocstore({}), {})
 
 
 
@@ -560,8 +591,8 @@ line 37(at the moment...) :     model: str = "mistral:7b" # we are running mistr
 
 
 
-
-
+sangmini/msmarco-cotmae-MiniLM-L12_en-ko-ja
+google/t5-efficient-mini
 
 
 

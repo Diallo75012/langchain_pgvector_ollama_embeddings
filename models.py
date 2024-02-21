@@ -8,3 +8,6 @@ class PgRecord(Base):
     __tablename__ = 'pgrecord'
     id_nbr = Column(Integer, primary_key=True) #will be unique and will autoincrement natively
     embedding_id = Column(Integer, nullable=True)
+
+# from sqlalchemy.dialects.postgresql import ARRAY
+# Column("data", ARRAY(Integer, dimensions=1024))
